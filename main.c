@@ -77,25 +77,9 @@ static void MX_USART1_UART_Init(void);
   */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
@@ -107,7 +91,10 @@ int main(void)
   MX_USART1_UART_Init();
 
   /* USER CODE BEGIN 2 */
+  /* 1. Запускаємо ініціалізацію фільтрів та SD-картки */
   UP_Init();
+
+  /* 2. Вмикаємо таймер, який почне смикати DMA кожні 10 мс */
   HAL_TIM_Base_Start_IT(&htim3);
   /* USER CODE END 2 */
 
@@ -115,7 +102,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    UP_RunLoop(); /* state machine + ring buffer — main_integration.c */
+    /* Основна логіка: обробка даних та запис логів на флешку */
+    UP_RunLoop();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
