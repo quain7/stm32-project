@@ -1,24 +1,17 @@
 /* ============================================================
- * urbanpulse_main.c  —  Top-level application logic  v5 (UART + SD)
+ * urbanpulse_main.c  —  Top-level application logic  v9 (TEST.TXT Fix)
  * ============================================================ */
 
 #include "urbanpulse.h"
 #include "fatfs.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
-/* ---- Extern HAL handles (генерує CubeMX в main.c) ---------- */
-extern I2C_HandleTypeDef hi2c1;   /* PB6=SCL, PB7=SDA          */
-extern SPI_HandleTypeDef hspi1;   /* PB13=SCK, PB14=MISO, PB15=MOSI */
-extern UART_HandleTypeDef huart1; /* PA9=TX, PA10=RX (Для ПК)  */
+extern I2C_HandleTypeDef hi2c1;
+extern SPI_HandleTypeDef hspi1;
+extern TIM_HandleTypeDef htim3;
 
-/* ---- CS пін SD-картки (SPI2, права сторона) ---------------- */
-#define SD_CS_PORT  GPIOA
-#define SD_CS_PIN   GPIO_PIN_4
-#define SD_CS_LOW()  HAL_GPIO_WritePin(SD_CS_PORT, SD_CS_PIN, GPIO_PIN_RESET)
-#define SD_CS_HIGH() HAL_GPIO_WritePin(SD_CS_PORT, SD_CS_PIN, GPIO_PIN_SET)
-
-/* ---- DSP module instances ---------------------------------- */
 static BiquadQ15_t         g_bpf_x, g_bpf_y, g_bpf_z;
 static StillnessDetector_t g_still;
 static Kalman1D_t          g_kalman;
@@ -27,23 +20,19 @@ static HilbertFIR_t        g_hilbert;
 static HaarWavelet_t       g_haar;
 HMM_t g_hmm;
 
-/* ---- RMS / peak акумулятори для 1-секундного вікна --------- */
 static float    g_rms_accum  = 0.0f;
 static float    g_peak_g     = 0.0f;
 static float    g_env_peak   = 0.0f;
 static uint32_t g_sample_cnt = 0;
 
-/* ---- Output record ----------------------------------------- */
 static RoadRecord_t g_record;
 
-/* ---- FatFS handles ----------------------------------------- */
 static FATFS   g_fs;
 static FIL     g_fil;
 static uint8_t g_file_open = 0;
+static uint8_t g_sd_error  = 0;
 
-/* ============================================================
- * MPU6050 — I2C1 (PB6/PB7)
- * ============================================================ */
+static uint8_t mpu_dma_buf[14];
 
 static HAL_StatusTypeDef MPU_Write(uint8_t reg, uint8_t val)
 {
@@ -60,42 +49,28 @@ static HAL_StatusTypeDef MPU_ReadWhoAmI(uint8_t *id)
     return HAL_I2C_Master_Receive(&hi2c1, MPU6050_ADDR, id, 1, 5);
 }
 
-/* ============================================================
- * FatFS / SD + UART
- * ============================================================ */
-
 static void SD_Open(void)
 {
-    SD_CS_HIGH();
+    /* Монтуємо SD-картку */
+    if (f_mount(&g_fs, "", 1) == FR_OK) {
 
-    // 1. ДАЄМО ФЛЕШЦІ ЧАС ПРОКИНУТИСЯ (Критично для павербанків!)
-    HAL_Delay(500);
+        /* Відкриваємо файл TEST.TXT (Великими літерами!) */
+        if (f_open(&g_fil, "TEST.TXT", FA_WRITE | FA_OPEN_ALWAYS) == FR_OK) {
 
-    // 2. Пробуємо змонтувати систему (цифра 1 означає "зробити це негайно")
-    if (f_mount(&g_fs, "", 1) != FR_OK) {
-        // Якщо не вийшло з першого разу — чекаємо ще пів секунди і пробуємо знову
-        HAL_Delay(500);
-        if (f_mount(&g_fs, "", 1) != FR_OK) {
-            return; // Якщо і тепер глухо — значить картки тупо немає або вона згоріла
+            f_lseek(&g_fil, f_size(&g_fil));
+
+            if (f_size(&g_fil) == 0) {
+                f_puts("timestamp_ms,rms_z_g,max_impact_g,kalman_disp_mm,envelope_peak,wavelet_e1,wavelet_e2,wavelet_e3,surface_class,is_still\r\n", &g_fil);
+                f_sync(&g_fil);
+            }
+
+            g_file_open = 1;
+            g_sd_error = 0;
+        } else {
+            g_sd_error = 2; /* Помилка файлу */
         }
-    }
-
-    // 3. Відкриваємо існуючий або СТВОРЮЄМО НОВИЙ файл
-    if (f_open(&g_fil, "road_log.csv", FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
-
-        // Зміщуємо курсор у самий кінець файлу, щоб не перезаписати старі дані
-        f_lseek(&g_fil, f_size(&g_fil));
-
-        // Якщо файл щойно створений (розмір 0 байт) — пишемо йому шапку з назвами стовпців
-        if (f_size(&g_fil) == 0) {
-            f_puts("timestamp_ms,rms_z_g,max_impact_g,kalman_disp_mm,"
-                   "envelope_peak,wavelet_e1,wavelet_e2,wavelet_e3,"
-                   "surface_class,is_still\r\n", &g_fil);
-            f_sync(&g_fil);
-        }
-
-        // Ставимо зелене світло для функції запису
-        g_file_open = 1;
+    } else {
+        g_sd_error = 1; /* Помилка монтування */
     }
 }
 
@@ -115,25 +90,22 @@ static void SD_FlushRecord(RoadRecord_t *r)
         r->surface_class,
         r->is_still);
 
-    /* 1. Відправляємо дані на комп'ютер через UART */
-    HAL_UART_Transmit(&huart1, (uint8_t*)line, strlen(line), 50);
-
-    /* 2. Якщо SD-картка є і відкрилася — пишемо і на неї */
     if (g_file_open) {
         f_puts(line, &g_fil);
         f_sync(&g_fil);
-
         HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
     }
 }
 
-/* ============================================================
- * UP_Init
- * ============================================================ */
-
 void UP_Init(void)
 {
-    HAL_Delay(100);
+    /* ОДРАЗУ ініціалізуємо флешку, як у твоєму тесті! */
+    SD_Open();
+
+    /* Виправляємо частоту таймера на 100 Гц */
+    __HAL_TIM_SET_PRESCALER(&htim3, 799);
+    __HAL_TIM_SET_AUTORELOAD(&htim3, 899);
+
     MPU_Write(MPU6050_PWR_MGMT_1, 0x00);
     MPU_Write(MPU6050_SMPLRT_DIV, 0x09);
     MPU_Write(MPU6050_CONFIG_REG,  0x03);
@@ -155,13 +127,7 @@ void UP_Init(void)
     HMM_Init(&g_hmm);
 
     memset(&g_record, 0, sizeof(g_record));
-
-    SD_Open();
 }
-
-/* ============================================================
- * UP_ProcessSample
- * ============================================================ */
 
 void UP_ProcessSample(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
                       int16_t gx_raw, int16_t gy_raw, int16_t gz_raw)
@@ -174,14 +140,10 @@ void UP_ProcessSample(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
     float ay_g = (float)ay_raw / ACCEL_SCALE_G;
     float az_g = (float)az_raw / ACCEL_SCALE_G;
 
-    Madgwick_Update(&g_madgwick,
-                    gx_rads, gy_rads, gz_rads,
-                    ax_g, ay_g, az_g);
-    float az_corrected_ms2 = Madgwick_GetVerticalAccel(
-                                &g_madgwick, ax_g, ay_g, az_g);
+    Madgwick_Update(&g_madgwick, gx_rads, gy_rads, gz_rads, ax_g, ay_g, az_g);
+    float az_corrected_ms2 = Madgwick_GetVerticalAccel(&g_madgwick, ax_g, ay_g, az_g);
 
-    int32_t az_q15 = (int32_t)(az_corrected_ms2 / G_TO_MS2
-                                * Q15_SCALE / 2.0f);
+    int32_t az_q15 = (int32_t)(az_corrected_ms2 / G_TO_MS2 * Q15_SCALE / 2.0f);
     if (az_q15 >  32767) az_q15 =  32767;
     if (az_q15 < -32768) az_q15 = -32768;
 
@@ -195,26 +157,18 @@ void UP_ProcessSample(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
 
     Stillness_Update(&g_still, ax_filt, ay_filt, az_filt_q15);
 
-    float disp_m = Kalman_Update(&g_kalman,
-                                 az_corrected_ms2,
-                                 g_still.is_still);
+    float disp_m = Kalman_Update(&g_kalman, az_corrected_ms2, g_still.is_still);
 
     Hilbert_Update(&g_hilbert, az_filt_q15);
     Haar_AddSample(&g_haar, az_filt_q15);
 
     float az_abs = fabsf(az_filt_g);
     g_rms_accum += az_filt_g * az_filt_g;
-    if (az_abs > g_peak_g)
-        g_peak_g = az_abs;
-    if (g_hilbert.envelope > g_env_peak)
-        g_env_peak = g_hilbert.envelope;
+    if (az_abs > g_peak_g) g_peak_g = az_abs;
+    if (g_hilbert.envelope > g_env_peak) g_env_peak = g_hilbert.envelope;
     g_sample_cnt++;
 
-    float obs[HMM_OBS_DIM] = {
-        az_abs,
-        g_hilbert.envelope,
-        g_haar.energy_L3
-    };
+    float obs[HMM_OBS_DIM] = { az_abs, g_hilbert.envelope, g_haar.energy_L3 };
     HMM_Update(&g_hmm, obs);
 
     g_record.surface_class    = g_hmm.current_state;
@@ -242,16 +196,9 @@ void UP_ProcessSample(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
     }
 }
 
-RoadRecord_t* UP_GetRecord(void)
-{
-    return &g_record;
-}
+RoadRecord_t* UP_GetRecord(void) { return &g_record; }
 
-/* ============================================================
- * Ring buffer + state machine
- * ============================================================ */
 #define RING_SIZE 128
-
 typedef struct { int16_t ax, ay, az, gx, gy, gz; } ImuSample_t;
 
 static volatile ImuSample_t g_ring[RING_SIZE];
@@ -275,8 +222,7 @@ ImuSample_t Ring_Pop(void)
     return s;
 }
 
-void Ring_Push(int16_t ax, int16_t ay, int16_t az,
-               int16_t gx, int16_t gy, int16_t gz)
+void Ring_Push(int16_t ax, int16_t ay, int16_t az, int16_t gx, int16_t gy, int16_t gz)
 {
     uint8_t next = (g_ring_head + 1) & (RING_SIZE - 1);
     if (next == g_ring_tail) return;
@@ -286,7 +232,6 @@ void Ring_Push(int16_t ax, int16_t ay, int16_t az,
     g_ring_head = next;
 }
 
-static uint8_t mpu_dma_buf[14];
 typedef enum { STATE_TAP_WAIT=0, STATE_CALIBRATE=1, STATE_RUN=2 } AppState_t;
 static volatile AppState_t g_state = STATE_TAP_WAIT;
 
@@ -321,30 +266,25 @@ static void Calib_AddSample(void)
     g_state = STATE_RUN;
 }
 
-/* ============================================================
- * Індикація станів (Асинхронний світлодіод)
- * ============================================================ */
 static void UP_UpdateLED(void)
 {
     static uint32_t last_toggle = 0;
-    uint32_t now = HAL_GetTick(); /* Беремо поточний час у мілісекундах */
+    uint32_t now = HAL_GetTick();
     uint32_t interval = 0;
 
-    /* Визначаємо, з якою швидкістю блимати залежно від стану */
     if (g_file_open == 0) {
-        interval = 50;  /* ПОМИЛКА: Флешки немає або не відкрилась. "Паніка" */
+        if (g_sd_error == 1)      interval = 50;   /* СТРОБОСКОП: SD-картку не знайдено */
+        else if (g_sd_error == 2) interval = 2000; /* ПОВІЛЬНО: Помилка відкриття файлу */
     } else if (g_state == STATE_TAP_WAIT) {
-        interval = 500; /* ОЧІКУВАННЯ: Спокійне блимання (чекаємо ляпаса) */
-    } else if (g_state == STATE_CALIBRATE) {
-        interval = 100; /* КАЛІБРУВАННЯ: Швидке блимання (збираємо базу) */
-    } else if (g_state == STATE_RUN) {
-        /* ЗАПИС: Тут нічого не робимо!
-           Блимати раз на секунду буде функція SD_FlushRecord,
-           щоб ти бачив реальний момент запису на флешку. */
+        /* Все ок! Діод просто горить */
+        HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
         return;
+    } else if (g_state == STATE_CALIBRATE) {
+        interval = 100; /* ШВИДКО: Йде калібрування HMM */
+    } else {
+        return; /* ЗАПИС: Блимає тільки під час запису (в SD_FlushRecord) */
     }
 
-    /* Якщо потрібний інтервал часу пройшов — перемикаємо стан діода */
     if (interval > 0 && (now - last_toggle >= interval)) {
         HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
         last_toggle = now;
@@ -353,7 +293,7 @@ static void UP_UpdateLED(void)
 
 void UP_RunLoop(void)
 {
-	UP_UpdateLED();
+    UP_UpdateLED();
 
     while (Ring_Available() > 0) {
         ImuSample_t s = Ring_Pop();
@@ -378,19 +318,12 @@ void UP_RunLoop(void)
     }
 }
 
-/* ============================================================
- * Таймерне переривання (100 Гц)
- * ============================================================ */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance != TIM3) return;
-
-    /* Запускаємо апаратне фонове читання (читаємо 14 байт, починаючи з регістра ACCEL_XOUT) */
-    /* Ця функція НЕ блокує мікроконтролер! */
     HAL_I2C_Mem_Read_DMA(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_XOUT, I2C_MEMADD_SIZE_8BIT, mpu_dma_buf, 14);
 }
 
-/* Ця функція викликається автоматично, коли DMA успішно завершив читання I2C */
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
     if (hi2c->Instance == I2C1) {
