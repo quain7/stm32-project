@@ -43,7 +43,7 @@ static BYTE SD_WaitReady(void) {
     uint32_t tmr = HAL_GetTick();
     do {
         res = SPI_TxRx(0xFF);
-    } while (res != 0xFF && (HAL_GetTick() - tmr) < 500);
+    } while (res != 0xFF && (HAL_GetTick() - tmr) < 3000); /* Збільшено таймаут до 3 сек */
     return res;
 }
 
