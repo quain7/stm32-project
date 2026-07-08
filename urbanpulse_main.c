@@ -1,31 +1,15 @@
 /* ============================================================
- * urbanpulse_main.c  —  Top-level application logic  v9 (TEST.TXT Fix)
+ * urbanpulse_main.c  —  Raw Logger
  * ============================================================ */
 
 #include "urbanpulse.h"
 #include "fatfs.h"
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 
 extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim3;
-
-static BiquadQ15_t         g_bpf_x, g_bpf_y, g_bpf_z;
-static StillnessDetector_t g_still;
-static Kalman1D_t          g_kalman;
-static Madgwick_t          g_madgwick;
-static HilbertFIR_t        g_hilbert;
-static HaarWavelet_t       g_haar;
-HMM_t g_hmm;
-
-static float    g_rms_accum  = 0.0f;
-static float    g_peak_g     = 0.0f;
-static float    g_env_peak   = 0.0f;
-static uint32_t g_sample_cnt = 0;
-
-static RoadRecord_t g_record;
 
 static FATFS   g_fs;
 static FIL     g_fil;
@@ -34,286 +18,105 @@ static uint8_t g_sd_error  = 0;
 
 static uint8_t mpu_dma_buf[14];
 
+/* Double Buffering */
+static ImuSample_t g_ping[CHUNK_SIZE];
+static ImuSample_t g_pong[CHUNK_SIZE];
+static ImuSample_t *g_active_buf = g_ping;
+static ImuSample_t *g_ready_buf = NULL;
+static volatile uint32_t g_buf_idx = 0;
+static volatile uint8_t g_buffer_ready = 0;
+
+/* Large text buffer */
+static char g_text_buf[6144];
+
 static HAL_StatusTypeDef MPU_Write(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = {reg, val};
     return HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, buf, 2, 10);
 }
 
-static HAL_StatusTypeDef MPU_ReadWhoAmI(uint8_t *id)
+void UP_Init(void)
 {
-    uint8_t reg = 0x75;
-    HAL_StatusTypeDef st;
-    st = HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, &reg, 1, 5);
-    if (st != HAL_OK) return st;
-    return HAL_I2C_Master_Receive(&hi2c1, MPU6050_ADDR, id, 1, 5);
-}
+    /* Mount SD Card immediately as in the original code.
+       Delaying here causes some SD cards to fail SPI initialization. */
+    g_sd_error = 1;
+    for (int i = 0; i < 3; i++) {
+        if (f_mount(&g_fs, "", 1) == FR_OK) {
+            g_sd_error = 0;
+            break;
+        }
+        HAL_Delay(50);
+    }
 
-static void SD_Open(void)
-{
-    /* Монтуємо SD-картку */
-    if (f_mount(&g_fs, "", 1) == FR_OK) {
-
-        /* Відкриваємо файл TEST.TXT (Великими літерами!) */
-        if (f_open(&g_fil, "TEST.TXT", FA_WRITE | FA_OPEN_ALWAYS) == FR_OK) {
-
+    if (g_sd_error == 0) {
+        /* Open TEST.TXT */
+        if (f_open(&g_fil, "TEST.TXT", FA_OPEN_ALWAYS | FA_WRITE) == FR_OK) {
             f_lseek(&g_fil, f_size(&g_fil));
 
             if (f_size(&g_fil) == 0) {
-                f_puts("timestamp_ms,rms_z_g,max_impact_g,kalman_disp_mm,envelope_peak,wavelet_e1,wavelet_e2,wavelet_e3,surface_class,is_still\r\n", &g_fil);
+                f_puts("timestamp_ms,ax,ay,az,gx,gy,gz\r\n", &g_fil);
                 f_sync(&g_fil);
             }
-
             g_file_open = 1;
-            g_sd_error = 0;
         } else {
-            g_sd_error = 2; /* Помилка файлу */
+            g_sd_error = 2; /* File error */
         }
-    } else {
-        g_sd_error = 1; /* Помилка монтування */
     }
-}
 
-static void SD_FlushRecord(RoadRecord_t *r)
-{
-    char line[160];
-    snprintf(line, sizeof(line),
-        "%lu,%.4f,%.4f,%.2f,%.4f,%.6f,%.6f,%.6f,%u,%u\r\n",
-        (unsigned long)r->timestamp_ms,
-        r->roughness_rms,
-        r->max_impact_g,
-        r->kalman_disp_mm,
-        r->envelope_peak,
-        r->wavelet_e1,
-        r->wavelet_e2,
-        r->wavelet_e3,
-        r->surface_class,
-        r->is_still);
+    /* Boot sequence: Wait 3 seconds for power stabilization BEFORE starting logging
+       and MPU6050 initialization. */
+    HAL_Delay(3000);
 
-    if (g_file_open) {
-        f_puts(line, &g_fil);
-        f_sync(&g_fil);
-        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-    }
-}
-
-void UP_Init(void)
-{
-    /* ОДРАЗУ ініціалізуємо флешку, як у твоєму тесті! */
-    SD_Open();
-
-    /* Виправляємо частоту таймера на 100 Гц */
+    /* Configure Timer */
     __HAL_TIM_SET_PRESCALER(&htim3, 799);
     __HAL_TIM_SET_AUTORELOAD(&htim3, 899);
 
+    /* Configure MPU6050 */
     MPU_Write(MPU6050_PWR_MGMT_1, 0x00);
     MPU_Write(MPU6050_SMPLRT_DIV, 0x09);
     MPU_Write(MPU6050_CONFIG_REG,  0x03);
     MPU_Write(MPU6050_GYRO_CFG,    0x00);
     MPU_Write(MPU6050_ACCEL_CFG,   0x00);
     HAL_Delay(10);
-
-    uint8_t who = 0;
-    MPU_ReadWhoAmI(&who);
-
-    BPF_Init(&g_bpf_x);
-    BPF_Init(&g_bpf_y);
-    BPF_Init(&g_bpf_z);
-    Stillness_Init(&g_still);
-    Kalman_Init(&g_kalman);
-    Madgwick_Init(&g_madgwick);
-    Hilbert_Init(&g_hilbert);
-    Haar_Init(&g_haar);
-    HMM_Init(&g_hmm);
-
-    memset(&g_record, 0, sizeof(g_record));
-}
-
-void UP_ProcessSample(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
-                      int16_t gx_raw, int16_t gy_raw, int16_t gz_raw)
-{
-    float gx_rads = (float)gx_raw / 131.0f * 0.017453f;
-    float gy_rads = (float)gy_raw / 131.0f * 0.017453f;
-    float gz_rads = (float)gz_raw / 131.0f * 0.017453f;
-
-    float ax_g = (float)ax_raw / ACCEL_SCALE_G;
-    float ay_g = (float)ay_raw / ACCEL_SCALE_G;
-    float az_g = (float)az_raw / ACCEL_SCALE_G;
-
-    Madgwick_Update(&g_madgwick, gx_rads, gy_rads, gz_rads, ax_g, ay_g, az_g);
-    float az_corrected_ms2 = Madgwick_GetVerticalAccel(&g_madgwick, ax_g, ay_g, az_g);
-
-    int32_t az_q15 = (int32_t)(az_corrected_ms2 / G_TO_MS2 * Q15_SCALE / 2.0f);
-    if (az_q15 >  32767) az_q15 =  32767;
-    if (az_q15 < -32768) az_q15 = -32768;
-
-    int32_t az_filt_q15 = BPF_Process(&g_bpf_z, az_q15);
-    float   az_filt_g   = (float)az_filt_q15 / Q15_SCALE * 2.0f;
-
-    int32_t ax_q15  = (int32_t)(ax_g * Q15_SCALE / 2.0f);
-    int32_t ay_q15  = (int32_t)(ay_g * Q15_SCALE / 2.0f);
-    int32_t ax_filt = BPF_Process(&g_bpf_x, ax_q15);
-    int32_t ay_filt = BPF_Process(&g_bpf_y, ay_q15);
-
-    Stillness_Update(&g_still, ax_filt, ay_filt, az_filt_q15);
-
-    float disp_m = Kalman_Update(&g_kalman, az_corrected_ms2, g_still.is_still);
-
-    Hilbert_Update(&g_hilbert, az_filt_q15);
-    Haar_AddSample(&g_haar, az_filt_q15);
-
-    float az_abs = fabsf(az_filt_g);
-    g_rms_accum += az_filt_g * az_filt_g;
-    if (az_abs > g_peak_g) g_peak_g = az_abs;
-    if (g_hilbert.envelope > g_env_peak) g_env_peak = g_hilbert.envelope;
-    g_sample_cnt++;
-
-    float obs[HMM_OBS_DIM] = { az_abs, g_hilbert.envelope, g_haar.energy_L3 };
-    HMM_Update(&g_hmm, obs);
-
-    g_record.surface_class    = g_hmm.current_state;
-    g_record.is_still         = g_still.is_still;
-    g_record.kalman_disp_mm   = disp_m * 1000.0f;
-    g_record.instant_z_abs    = az_abs;
-    g_record.instant_envelope = g_hilbert.envelope;
-    g_record.instant_w3       = g_haar.energy_L3;
-
-    if (g_sample_cnt >= SAMPLE_RATE_HZ) {
-        g_record.timestamp_ms  = HAL_GetTick();
-        g_record.roughness_rms = sqrtf(g_rms_accum / g_sample_cnt);
-        g_record.max_impact_g  = g_peak_g;
-        g_record.envelope_peak = g_env_peak;
-        g_record.wavelet_e1    = g_haar.energy_L1;
-        g_record.wavelet_e2    = g_haar.energy_L2;
-        g_record.wavelet_e3    = g_haar.energy_L3;
-
-        SD_FlushRecord(&g_record);
-
-        g_rms_accum  = 0.0f;
-        g_peak_g     = 0.0f;
-        g_env_peak   = 0.0f;
-        g_sample_cnt = 0;
-    }
-}
-
-RoadRecord_t* UP_GetRecord(void) { return &g_record; }
-
-#define RING_SIZE 128
-typedef struct { int16_t ax, ay, az, gx, gy, gz; } ImuSample_t;
-
-static volatile ImuSample_t g_ring[RING_SIZE];
-static volatile uint8_t     g_ring_head = 0;
-static volatile uint8_t     g_ring_tail = 0;
-
-uint8_t Ring_Available(void)
-{
-    __disable_irq();
-    uint8_t h = g_ring_head, t = g_ring_tail;
-    __enable_irq();
-    return (uint8_t)((h - t) & (RING_SIZE - 1));
-}
-
-ImuSample_t Ring_Pop(void)
-{
-    __disable_irq();
-    ImuSample_t s = g_ring[g_ring_tail];
-    g_ring_tail = (g_ring_tail + 1) & (RING_SIZE - 1);
-    __enable_irq();
-    return s;
-}
-
-void Ring_Push(int16_t ax, int16_t ay, int16_t az, int16_t gx, int16_t gy, int16_t gz)
-{
-    uint8_t next = (g_ring_head + 1) & (RING_SIZE - 1);
-    if (next == g_ring_tail) return;
-    g_ring[g_ring_head].ax = ax; g_ring[g_ring_head].ay = ay;
-    g_ring[g_ring_head].az = az; g_ring[g_ring_head].gx = gx;
-    g_ring[g_ring_head].gy = gy; g_ring[g_ring_head].gz = gz;
-    g_ring_head = next;
-}
-
-typedef enum { STATE_TAP_WAIT=0, STATE_CALIBRATE=1, STATE_RUN=2 } AppState_t;
-static volatile AppState_t g_state = STATE_TAP_WAIT;
-
-#define CALIB_SAMPLES (30 * SAMPLE_RATE_HZ)
-static uint32_t g_calib_count   = 0;
-static double   g_calib_sum_rms = 0.0;
-static double   g_calib_sum_env = 0.0;
-static double   g_calib_sum_w3  = 0.0;
-
-static void Calib_AddSample(void)
-{
-    RoadRecord_t *r = &g_record;
-    g_calib_sum_rms += r->instant_z_abs;
-    g_calib_sum_env += r->instant_envelope;
-    g_calib_sum_w3  += r->instant_w3;
-    if (++g_calib_count < CALIB_SAMPLES) return;
-
-    g_hmm.mu[0][0] = (float)(g_calib_sum_rms / g_calib_count);
-    g_hmm.mu[0][1] = (float)(g_calib_sum_env / g_calib_count);
-    g_hmm.mu[0][2] = (float)(g_calib_sum_w3  / g_calib_count);
-
-    float b0=g_hmm.mu[0][0], b1=g_hmm.mu[0][1], b2=g_hmm.mu[0][2];
-    g_hmm.mu[1][0]=b0*3.f;  g_hmm.mu[1][1]=b1*3.f;  g_hmm.mu[1][2]=b2*3.f;
-    g_hmm.mu[2][0]=b0*6.f;  g_hmm.mu[2][1]=b1*5.f;  g_hmm.mu[2][2]=b2*6.f;
-    g_hmm.mu[3][0]=b0*12.f; g_hmm.mu[3][1]=b1*15.f; g_hmm.mu[3][2]=b2*12.f;
-    g_hmm.mu[4][0]=b0*8.f;  g_hmm.mu[4][1]=b1*12.f; g_hmm.mu[4][2]=b2*8.f;
-
-    for (int s=0;s<HMM_STATES;s++)
-        for (int d=0;d<HMM_OBS_DIM;d++)
-            g_hmm.sigma[s][d] = g_hmm.mu[s][d]*0.4f + 1e-6f;
-
-    g_state = STATE_RUN;
-}
-
-static void UP_UpdateLED(void)
-{
-    static uint32_t last_toggle = 0;
-    uint32_t now = HAL_GetTick();
-    uint32_t interval = 0;
-
-    if (g_file_open == 0) {
-        if (g_sd_error == 1)      interval = 50;   /* СТРОБОСКОП: SD-картку не знайдено */
-        else if (g_sd_error == 2) interval = 2000; /* ПОВІЛЬНО: Помилка відкриття файлу */
-    } else if (g_state == STATE_TAP_WAIT) {
-        /* Все ок! Діод просто горить */
-        HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-        return;
-    } else if (g_state == STATE_CALIBRATE) {
-        interval = 100; /* ШВИДКО: Йде калібрування HMM */
-    } else {
-        return; /* ЗАПИС: Блимає тільки під час запису (в SD_FlushRecord) */
-    }
-
-    if (interval > 0 && (now - last_toggle >= interval)) {
-        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-        last_toggle = now;
-    }
 }
 
 void UP_RunLoop(void)
 {
-    UP_UpdateLED();
+    if (g_buffer_ready) {
+        if (g_file_open) {
+            char *ptr = g_text_buf;
+            int remaining = sizeof(g_text_buf);
 
-    while (Ring_Available() > 0) {
-        ImuSample_t s = Ring_Pop();
-        switch (g_state) {
-        case STATE_TAP_WAIT: {
-            float az_g = (float)s.az / ACCEL_SCALE_G;
-            if (fabsf(az_g) > TAP_THRESHOLD_G) {
-                g_state = STATE_CALIBRATE;
-                g_calib_count = 0;
-                g_calib_sum_rms = g_calib_sum_env = g_calib_sum_w3 = 0.0;
+            for (int i = 0; i < CHUNK_SIZE; i++) {
+                ImuSample_t *s = &g_ready_buf[i];
+                int len = snprintf(ptr, remaining, "%lu,%d,%d,%d,%d,%d,%d\r\n",
+                         (unsigned long)s->timestamp_ms,
+                         s->ax, s->ay, s->az,
+                         s->gx, s->gy, s->gz);
+                if (len > 0 && len < remaining) {
+                    ptr += len;
+                    remaining -= len;
+                }
             }
-            break;
+
+            UINT bytes_written;
+            f_write(&g_fil, g_text_buf, ptr - g_text_buf, &bytes_written);
+            f_sync(&g_fil);
+
+            /* Indication: Toggle LED when buffer is flushed */
+            HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
         }
-        case STATE_CALIBRATE:
-            UP_ProcessSample(s.ax,s.ay,s.az,s.gx,s.gy,s.gz);
-            Calib_AddSample();
-            break;
-        case STATE_RUN:
-            UP_ProcessSample(s.ax,s.ay,s.az,s.gx,s.gy,s.gz);
-            break;
+        g_buffer_ready = 0;
+    } else if (!g_file_open) {
+        /* Blink LED to indicate SD error:
+           g_sd_error == 1 (No SD card) -> 50ms (strobe)
+           g_sd_error == 2 (File error) -> 2000ms (slow blink) */
+        static uint32_t last_toggle = 0;
+        uint32_t now = HAL_GetTick();
+        uint32_t interval = (g_sd_error == 1) ? 50 : 2000;
+        if (interval > 0 && (now - last_toggle >= interval)) {
+            HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+            last_toggle = now;
         }
     }
 }
@@ -327,6 +130,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
     if (hi2c->Instance == I2C1) {
+        if (g_buffer_ready) {
+            /* Main loop didn't process previous chunk fast enough.
+               Ignore new samples to prevent overwriting active buffer. */
+            return;
+        }
+
         int16_t ax = (int16_t)((mpu_dma_buf[0]  << 8) | mpu_dma_buf[1]);
         int16_t ay = (int16_t)((mpu_dma_buf[2]  << 8) | mpu_dma_buf[3]);
         int16_t az = (int16_t)((mpu_dma_buf[4]  << 8) | mpu_dma_buf[5]);
@@ -334,6 +143,20 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
         int16_t gy = (int16_t)((mpu_dma_buf[10] << 8) | mpu_dma_buf[11]);
         int16_t gz = (int16_t)((mpu_dma_buf[12] << 8) | mpu_dma_buf[13]);
 
-        Ring_Push(ax, ay, az, gx, gy, gz);
+        g_active_buf[g_buf_idx].ax = ax;
+        g_active_buf[g_buf_idx].ay = ay;
+        g_active_buf[g_buf_idx].az = az;
+        g_active_buf[g_buf_idx].gx = gx;
+        g_active_buf[g_buf_idx].gy = gy;
+        g_active_buf[g_buf_idx].gz = gz;
+        g_active_buf[g_buf_idx].timestamp_ms = HAL_GetTick();
+
+        g_buf_idx++;
+        if (g_buf_idx >= CHUNK_SIZE) {
+            g_ready_buf = g_active_buf;
+            g_active_buf = (g_active_buf == g_ping) ? g_pong : g_ping;
+            g_buf_idx = 0;
+            g_buffer_ready = 1;
+        }
     }
 }
