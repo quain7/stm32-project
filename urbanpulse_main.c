@@ -10,7 +10,7 @@
 extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim3;
-extern UART_HandleTypeDef huart1; // <--- ДОДАНО ДЛЯ UART
+extern UART_HandleTypeDef huart1;
 
 static FATFS   g_fs;
 static FIL     g_fil;
@@ -29,6 +29,37 @@ static volatile uint8_t g_buffer_ready = 0;
 
 /* Large text buffer */
 static char g_text_buf[6144];
+
+/* Фонова затримка для розклинення шини (приблизно 10 мікросекунд) */
+static void I2C_Delay(void) {
+    for (volatile int j = 0; j < 1000; j++) {}
+}
+
+/* Жорстке перезавантаження завислої шини I2C (I2C Bus Clear) */
+static void I2C_RecoverBus(void)
+{
+    HAL_I2C_DeInit(&hi2c1);
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    /* Піни I2C1 на STM32F103: SCL = PB6, SDA = PB7 */
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* Б'ємо імпульсами (клокаємо), щоб датчик відпустив замкнуту лінію SDA */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+    for(int i = 0; i < 9; i++) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+        I2C_Delay();
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+        I2C_Delay();
+    }
+
+    /* Знову ініціалізуємо I2C1 (він сам поверне піни в правильний режим) */
+    HAL_I2C_Init(&hi2c1);
+}
 
 static HAL_StatusTypeDef MPU_Write(uint8_t reg, uint8_t val)
 {
@@ -77,6 +108,9 @@ void UP_Init(void)
     /* Configure Timer */
     __HAL_TIM_SET_PRESCALER(&htim3, 799);
     __HAL_TIM_SET_AUTORELOAD(&htim3, 899);
+
+    /* Перед запуском обов'язково чистимо шину I2C на випадок, якщо датчик завис при рестарті */
+    I2C_RecoverBus();
 
     /* Configure MPU6050 */
     MPU_Write(MPU6050_PWR_MGMT_1, 0x00);
@@ -146,14 +180,15 @@ void UP_RunLoop(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM3) {
-        /* I2C Vibration Recovery */
+        /* Якщо I2C завис у стані роботи (не повернувся в READY за 10 мс) */
         if (hi2c1.State != HAL_I2C_STATE_READY) {
-            HAL_I2C_DeInit(&hi2c1);
-            HAL_I2C_Init(&hi2c1);
+            I2C_RecoverBus();
         }
 
-        /* Trigger I2C DMA read of MPU6050 data */
-        HAL_I2C_Mem_Read_DMA(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_XOUT, I2C_MEMADD_SIZE_8BIT, mpu_dma_buf, 14);
+        /* Запускаємо читання. Якщо шина фізично замкнута датчиком, функція поверне помилку */
+        if (HAL_I2C_Mem_Read_DMA(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_XOUT, I2C_MEMADD_SIZE_8BIT, mpu_dma_buf, 14) != HAL_OK) {
+            I2C_RecoverBus();
+        }
     }
 }
 
